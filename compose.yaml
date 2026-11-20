@@ -1,0 +1,32 @@
+services:
+  minecraft:
+    build:
+      context: .
+      args:
+        PAPER_API_VERSION: ${PAPER_API_VERSION:-26.3-R0.1-SNAPSHOT}
+    image: seedserver:26.3
+    container_name: seedserver
+    restart: unless-stopped
+    init: true
+    ports:
+      - "25566:25566/tcp"
+    environment:
+      EULA: "${EULA:-FALSE}"
+      TYPE: PAPER
+      VERSION: "26.3"
+      SERVER_PORT: "25566"
+      LEVEL: seedserver
+      ONLINE_MODE: "${ONLINE_MODE:-TRUE}"
+      MEMORY: "${MEMORY:-4G}"
+      MODE: creative
+      FORCE_GAMEMODE: "true"
+      MAX_PLAYERS: "${MAX_PLAYERS:-20}"
+      DIFFICULTY: normal
+      SPAWN_PROTECTION: "0"
+      VIEW_DISTANCE: "10"
+      SIMULATION_DISTANCE: "8"
+      ENABLE_RCON: "false"
+    volumes:
+      - ./data:/data
+    stdin_open: true
+    tty: true

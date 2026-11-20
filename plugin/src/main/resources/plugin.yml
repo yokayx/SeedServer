@@ -1,0 +1,15 @@
+name: SeedServer
+version: 1.0.0
+main: ru.seedserver.SeedServerPlugin
+api-version: '26.3'
+description: Prepares worlds with unique seeds and rotates all players with /next seed.
+commands:
+  next:
+    description: Перейти в следующий подготовленный мир
+    usage: /next seed
+    permission: seedserver.next
+    permission-message: У вас нет прав для смены мира.
+permissions:
+  seedserver.next:
+    description: Разрешает запуск следующего мира
+    default: op

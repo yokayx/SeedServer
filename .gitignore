@@ -1,0 +1,12 @@
+# Minecraft server data and user configuration
+data/
+.env
+
+# Java / Maven
+**/target/
+*.class
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
