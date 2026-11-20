@@ -2,6 +2,7 @@ name: SeedServer
 version: 1.0.0
 main: ru.seedserver.SeedServerPlugin
 api-version: '26.3'
+folia-supported: true
 description: Prepares worlds with unique seeds and rotates all players with /next seed.
 commands:
   next:
