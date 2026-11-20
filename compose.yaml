@@ -2,9 +2,7 @@ services:
   minecraft:
     build:
       context: .
-      args:
-        PAPER_API_VERSION: ${PAPER_API_VERSION:-26.3-R0.1-SNAPSHOT}
-    image: seedserver:26.3
+    image: seedserver:26.3-folia
     container_name: seedserver
     restart: unless-stopped
     init: true
@@ -12,8 +10,9 @@ services:
       - "25566:25566/tcp"
     environment:
       EULA: "${EULA:-FALSE}"
-      TYPE: PAPER
+      TYPE: FOLIA
       VERSION: "26.3"
+      FOLIA_CHANNEL: default
       SERVER_PORT: "25566"
       LEVEL: seedserver
       ONLINE_MODE: "${ONLINE_MODE:-TRUE}"
@@ -23,7 +22,7 @@ services:
       MAX_PLAYERS: "${MAX_PLAYERS:-20}"
       DIFFICULTY: normal
       SPAWN_PROTECTION: "0"
-      VIEW_DISTANCE: "10"
+      VIEW_DISTANCE: "32"
       SIMULATION_DISTANCE: "8"
       ENABLE_RCON: "false"
     volumes:

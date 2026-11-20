@@ -8,12 +8,12 @@
   <artifactId>seedserver</artifactId>
   <version>1.0.0</version>
   <name>SeedServer</name>
-  <description>Seed rolling and world preparation for a Paper Minecraft server.</description>
+  <description>Seed rolling and world preparation for a Folia Minecraft server.</description>
 
   <properties>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <maven.compiler.release>25</maven.compiler.release>
-    <paper.version>26.3-R0.1-SNAPSHOT</paper.version>
+    <folia.version>[26.3.build,)</folia.version>
   </properties>
 
   <repositories>
@@ -25,9 +25,9 @@
 
   <dependencies>
     <dependency>
-      <groupId>io.papermc.paper</groupId>
-      <artifactId>paper-api</artifactId>
-      <version>${paper.version}</version>
+      <groupId>dev.folia</groupId>
+      <artifactId>folia-api</artifactId>
+      <version>${folia.version}</version>
       <scope>provided</scope>
     </dependency>
   </dependencies>

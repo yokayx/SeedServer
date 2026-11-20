@@ -10,6 +10,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 
 import net.kyori.adventure.text.Component;
@@ -34,7 +36,6 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.player.PlayerGameModeChangeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.plugin.java.JavaPlugin;
-import org.bukkit.scheduler.BukkitRunnable;
 
 public final class SeedServerPlugin extends JavaPlugin implements Listener, CommandExecutor {
     private static final String WORLD_PREFIX = "seed-roll-";
@@ -46,8 +47,10 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
 
     private File stateFile;
     private List<String> savedUpcomingWorldNames = List.of();
-    private World activeWorld;
+    private String savedActiveWorldName;
+    private volatile World activeWorld;
     private int nextWorldId = 1;
+    // Read and written only from the Folia global-region scheduler.
     private boolean switchingWorld;
 
     @Override
@@ -57,34 +60,17 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
 
         try {
             readState();
-            activeWorld = loadActiveWorld();
-            seedByWorld.put(activeWorld.getName(), activeWorld.getSeed());
-
             if (getCommand("next") == null) {
                 throw new IllegalStateException("Команда /next не объявлена в plugin.yml");
             }
             getCommand("next").setExecutor(this);
             getServer().getPluginManager().registerEvents(this, this);
 
-            loadSavedUpcomingWorlds();
-            maintainWarmQueue();
-            saveState();
-
-            getLogger().info("Активный мир: " + activeWorld.getName() + ", seed=" + activeWorld.getSeed());
+            // World creation, queue changes, and persistence are serialized on Folia's global region.
+            Bukkit.getGlobalRegionScheduler().run(this, task -> initializeWorlds());
         } catch (Exception exception) {
             getLogger().log(Level.SEVERE, "Не удалось запустить SeedServer", exception);
             getServer().getPluginManager().disablePlugin(this);
-        }
-    }
-
-    @Override
-    public void onDisable() {
-        if (stateFile != null && activeWorld != null) {
-            try {
-                saveState();
-            } catch (RuntimeException exception) {
-                getLogger().log(Level.SEVERE, "Не удалось сохранить состояние SeedServer", exception);
-            }
         }
     }
 
@@ -104,43 +90,15 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
             return true;
         }
 
-        if (switchingWorld) {
-            sender.sendMessage("Смена мира уже выполняется.");
-            return true;
-        }
-
-        PreparedWorld next = upcomingWorlds.peekFirst();
-        if (next == null) {
-            sender.sendMessage("Следующий мир ещё не создан. Попробуйте немного позже.");
-            return true;
-        }
-        if (next.failed) {
-            sender.sendMessage("Подготовка следующего мира завершилась ошибкой. Проверьте журнал сервера.");
-            return true;
-        }
-        if (!next.ready) {
-            sender.sendMessage("Следующий мир ещё готовится. Повторите /next seed через несколько секунд.");
-            return true;
-        }
-
-        switchTo(next, sender);
+        // Player commands run on their entity's region; move shared state work to the global region.
+        Bukkit.getGlobalRegionScheduler().run(this, task -> handleNext(sender));
         return true;
     }
 
     @EventHandler
     public void onPlayerJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        Bukkit.getScheduler().runTask(this, () -> {
-            if (!player.isOnline() || activeWorld == null) {
-                return;
-            }
-
-            player.setGameMode(GameMode.CREATIVE);
-            if (player.getWorld() != activeWorld) {
-                player.teleport(activeWorld.getSpawnLocation());
-            }
-            player.sendMessage(seedMessage("Текущий сид: ", activeWorld.getSeed()));
-        });
+        Bukkit.getGlobalRegionScheduler().run(this, task -> updatePlayerForActiveWorld(player, true, 20));
     }
 
     @EventHandler
@@ -149,6 +107,25 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
             event.setCancelled(true);
             event.getPlayer().sendMessage(
                     Component.text("На этом сервере доступен только креативный режим.", NamedTextColor.RED));
+        }
+    }
+
+    private void initializeWorlds() {
+        try {
+            activeWorld = loadActiveWorld();
+            seedByWorld.put(activeWorld.getName(), activeWorld.getSeed());
+
+            loadSavedUpcomingWorlds();
+            maintainWarmQueue();
+            saveState();
+
+            getLogger().info("Активный мир: " + activeWorld.getName() + ", seed=" + activeWorld.getSeed());
+            for (Player player : Bukkit.getOnlinePlayers()) {
+                updatePlayerForActiveWorld(player, true, 0);
+            }
+        } catch (Exception exception) {
+            getLogger().log(Level.SEVERE, "Не удалось инициализировать миры SeedServer", exception);
+            getServer().getPluginManager().disablePlugin(this);
         }
     }
 
@@ -163,13 +140,11 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
 
         String savedActiveWorld = state.getString("active-world");
         if (savedActiveWorld != null && !savedActiveWorld.isBlank()) {
-            this.savedActiveWorldName = savedActiveWorld;
+            savedActiveWorldName = savedActiveWorld;
         }
         nextWorldId = Math.max(1, state.getInt("next-world-id", 1));
         savedUpcomingWorldNames = new ArrayList<>(state.getStringList("upcoming-worlds"));
     }
-
-    private String savedActiveWorldName;
 
     private World loadActiveWorld() {
         if (savedActiveWorldName != null) {
@@ -249,35 +224,56 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
     private void startPreGeneration(PreparedWorld prepared) {
         int radius = Math.max(0, Math.min(32, getConfig().getInt("pregeneration-radius-chunks", 4)));
         int chunksPerTick = Math.max(1, Math.min(16, getConfig().getInt("chunks-per-tick", 1)));
-        List<ChunkPosition> chunks = buildChunkOrder(prepared.world.getSpawnLocation(), radius);
+        prepared.chunks = buildChunkOrder(prepared.world.getSpawnLocation(), radius);
 
-        new BukkitRunnable() {
-            private int cursor;
+        // Global scheduler decides which chunk to prepare; the actual chunk access runs
+        // through RegionScheduler so Folia executes it on the owning region.
+        Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, task -> {
+            RuntimeException failure = prepared.generationFailure.get();
+            if (failure != null) {
+                prepared.failed = true;
+                task.cancel();
+                getLogger().log(Level.SEVERE,
+                        "Ошибка подготовки мира " + prepared.name + ", seed=" + prepared.seed,
+                        failure);
+                return;
+            }
 
-            @Override
-            public void run() {
+            for (int scheduled = 0;
+                 scheduled < chunksPerTick && prepared.nextChunkIndex < prepared.chunks.size();
+                 scheduled++) {
+                ChunkPosition position = prepared.chunks.get(prepared.nextChunkIndex++);
                 try {
-                    for (int generated = 0; generated < chunksPerTick && cursor < chunks.size(); generated++) {
-                        ChunkPosition position = chunks.get(cursor++);
-                        prepared.world.getChunkAt(position.x, position.z);
-                        prepared.world.unloadChunk(position.x, position.z, true);
-                    }
+                    Bukkit.getRegionScheduler().run(this, prepared.world, position.x, position.z, regionTask -> {
+                        try {
+                            prepared.world.getChunkAt(position.x, position.z);
+                        } catch (RuntimeException exception) {
+                            prepared.generationFailure.compareAndSet(null, exception);
+                        } finally {
+                            prepared.completedChunks.incrementAndGet();
+                        }
+                    });
                 } catch (RuntimeException exception) {
-                    prepared.failed = true;
-                    cancel();
-                    getLogger().log(Level.SEVERE,
-                            "Ошибка подготовки мира " + prepared.name + ", seed=" + prepared.seed,
-                            exception);
-                    return;
-                }
-
-                if (cursor >= chunks.size()) {
-                    prepared.ready = true;
-                    cancel();
-                    getLogger().info("Мир готов: " + prepared.name + ", seed=" + prepared.seed);
+                    prepared.generationFailure.compareAndSet(null, exception);
+                    prepared.completedChunks.incrementAndGet();
                 }
             }
-        }.runTaskTimer(this, 1L, 1L);
+
+            if (prepared.nextChunkIndex >= prepared.chunks.size()
+                    && prepared.completedChunks.get() >= prepared.chunks.size()) {
+                RuntimeException finalFailure = prepared.generationFailure.get();
+                if (finalFailure != null) {
+                    prepared.failed = true;
+                    getLogger().log(Level.SEVERE,
+                            "Ошибка подготовки мира " + prepared.name + ", seed=" + prepared.seed,
+                            finalFailure);
+                } else {
+                    prepared.ready = true;
+                    getLogger().info("Мир готов: " + prepared.name + ", seed=" + prepared.seed);
+                }
+                task.cancel();
+            }
+        }, 1L, 1L);
     }
 
     private List<ChunkPosition> buildChunkOrder(Location spawn, int radius) {
@@ -299,43 +295,111 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
         return result;
     }
 
+    private void handleNext(CommandSender sender) {
+        if (switchingWorld) {
+            reply(sender, "Смена мира уже выполняется.");
+            return;
+        }
+
+        PreparedWorld next = upcomingWorlds.peekFirst();
+        if (next == null) {
+            reply(sender, "Следующий мир ещё не создан. Попробуйте немного позже.");
+            return;
+        }
+        if (next.failed) {
+            reply(sender, "Подготовка следующего мира завершилась ошибкой. Проверьте журнал сервера.");
+            return;
+        }
+        if (!next.ready) {
+            reply(sender, "Следующий мир ещё готовится. Повторите /next seed через несколько секунд.");
+            return;
+        }
+
+        switchTo(next, sender);
+    }
+
     private void switchTo(PreparedWorld next, CommandSender sender) {
         switchingWorld = true;
         try {
             upcomingWorlds.removeFirst();
             activeWorld = next.world;
             seedByWorld.put(activeWorld.getName(), activeWorld.getSeed());
-            saveState();
+            saveStateSafely();
 
             Location spawn = activeWorld.getSpawnLocation();
-            for (Player player : Bukkit.getOnlinePlayers()) {
-                player.setGameMode(GameMode.CREATIVE);
-                if (!player.teleport(spawn)) {
-                    getLogger().warning("Не удалось переместить игрока " + player.getName() + " в " + activeWorld.getName());
-                }
+            Component message = seedMessage("Мир изменён. Сид: ", activeWorld.getSeed());
+            for (Player player : List.copyOf(Bukkit.getOnlinePlayers())) {
+                teleportPlayer(player, activeWorld, spawn, message);
+            }
+
+            getLogger().info("Мир изменён на " + activeWorld.getName() + ", seed=" + activeWorld.getSeed());
+            if (!(sender instanceof Player)) {
+                sender.sendMessage("Мир изменён на " + activeWorld.getName() + ", seed=" + activeWorld.getSeed());
             }
         } catch (RuntimeException exception) {
             getLogger().log(Level.SEVERE, "Не удалось переключить мир", exception);
-            sender.sendMessage("Не удалось сменить мир. Проверьте журнал сервера.");
+            reply(sender, "Не удалось сменить мир. Проверьте журнал сервера.");
             return;
         } finally {
             switchingWorld = false;
         }
 
-        Component message = seedMessage("Мир изменён. Сид: ", activeWorld.getSeed());
-        for (Player player : Bukkit.getOnlinePlayers()) {
-            player.sendMessage(message);
-        }
-        getLogger().info("Мир изменён на " + activeWorld.getName() + ", seed=" + activeWorld.getSeed());
-        if (!(sender instanceof Player)) {
-            sender.sendMessage("Мир изменён на " + activeWorld.getName() + ", seed=" + activeWorld.getSeed());
-        }
-
         try {
             maintainWarmQueue();
-            saveState();
+            saveStateSafely();
         } catch (RuntimeException exception) {
             getLogger().log(Level.SEVERE, "Мир сменён, но не удалось подготовить очередь миров", exception);
+        }
+    }
+
+    private void updatePlayerForActiveWorld(Player player, boolean announce, int retries) {
+        World target = activeWorld;
+        if (target == null) {
+            if (retries > 0) {
+                Bukkit.getGlobalRegionScheduler().runDelayed(
+                        this,
+                        task -> updatePlayerForActiveWorld(player, announce, retries - 1),
+                        1L);
+            }
+            return;
+        }
+
+        Location spawn = target.getSpawnLocation();
+        Component message = announce ? seedMessage("Текущий сид: ", target.getSeed()) : null;
+        teleportPlayer(player, target, spawn, message);
+    }
+
+    private void teleportPlayer(Player player, World target, Location spawn, Component message) {
+        player.getScheduler().run(this, task -> {
+            if (!player.isOnline()) {
+                return;
+            }
+
+            player.setGameMode(GameMode.CREATIVE);
+            if (player.getWorld() != target) {
+                player.teleportAsync(spawn.clone()).whenComplete((success, exception) -> {
+                    if (exception != null) {
+                        getLogger().log(Level.WARNING, "Не удалось переместить игрока " + player.getName(), exception);
+                    } else if (!Boolean.TRUE.equals(success)) {
+                        getLogger().warning("Телепорт игрока " + player.getName() + " был отклонён");
+                    }
+                });
+            }
+            if (message != null) {
+                player.sendMessage(message);
+            }
+        }, () -> {
+            // The player disconnected before the queued entity task could run.
+        });
+    }
+
+    private void reply(CommandSender sender, String message) {
+        if (sender instanceof Player player) {
+            player.getScheduler().run(this, task -> player.sendMessage(message), () -> {
+                // The sender disconnected before the response could be delivered.
+            });
+        } else {
+            sender.sendMessage(message);
         }
     }
 
@@ -357,11 +421,15 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
         }
     }
 
-    private void saveState() {
-        if (stateFile == null) {
-            return;
+    private void saveStateSafely() {
+        try {
+            saveState();
+        } catch (RuntimeException exception) {
+            getLogger().log(Level.SEVERE, "Не удалось сохранить состояние SeedServer", exception);
         }
+    }
 
+    private void saveState() {
         YamlConfiguration state = new YamlConfiguration();
         if (activeWorld != null) {
             state.set("active-world", activeWorld.getName());
@@ -392,8 +460,12 @@ public final class SeedServerPlugin extends JavaPlugin implements Listener, Comm
         private final String name;
         private final long seed;
         private final World world;
-        private boolean ready;
-        private boolean failed;
+        private final AtomicInteger completedChunks = new AtomicInteger();
+        private final AtomicReference<RuntimeException> generationFailure = new AtomicReference<>();
+        private List<ChunkPosition> chunks = List.of();
+        private int nextChunkIndex;
+        private volatile boolean ready;
+        private volatile boolean failed;
 
         private PreparedWorld(String name, long seed, World world) {
             this.name = name;
